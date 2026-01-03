@@ -4,17 +4,18 @@ This document provides a detailed plan, architectural blueprint, and technical s
 
 ## 1. Introduction & Scope
 
-The goal is to create a safe, idiomatic, and high-performance Rust implementation of the JPEG 2000 standard (ISO/IEC 15444-1).
+The goal is to create a safe, idiomatic, and high-performance Rust implementation of the JPEG 2000 standard (ISO/IEC 15444-1) and supported extensions (ISO/IEC 15444-2) as found in OpenJPEG.
 
 ### Supported Features (Scope)
 *   **Profiles**: Profile 0, 1 (standard), Cinema 2K/4K, IMF, Broadcast.
 *   **Transforms**: 5-3 Reversible DWT (Integer), 9-7 Irreversible DWT (Floating point).
 *   **Quantization**: Scalar quantization, derived and expounded.
 *   **Entropy Coding**: Tier 1 EBCOT (Context-adaptive arithmetic coding).
-*   **Codestream**: Tier 2 Packet coding, Tag Trees, Markers (SOC, SOT, SOD, EOC, SIZ, COD, QCD, etc.).
+*   **Codestream**: Tier 2 Packet coding, Tag Trees, Markers (SOC, SOT, SOD, EOC, SIZ, COD, QCD, PLT, TLM, PPM, PPT, etc.).
 *   **Progression Orders**: LRCP, RLCP, RPCL, PCRL, CPRL.
-*   **File Format**: JP2 (boxes: `jP`, `ftyp`, `jp2h`, `jp2c`, `colr`, `ihdr`).
+*   **File Format**: JP2 (boxes: `jP`, `ftyp`, `jp2h`, `jp2c`, `colr`, `ihdr`, `pclr`, `cmap`, `cdef`).
 *   **Color Spaces**: sRGB, Greyscale, YUV, e-YCC, CMYK.
+*   **Advanced Features**: ROI (Region of Interest), Tile Parts, Partial Decoding, Multi-Component Transforms (MCT).
 
 ---
 
@@ -54,6 +55,7 @@ pub struct Image {
     pub numcomps: u32,
     pub color_space: ColorSpace,
     pub components: Vec<ImageComp>,
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 pub struct ImageComp {
@@ -62,6 +64,7 @@ pub struct ImageComp {
     pub x0: u32, pub y0: u32,
     pub prec: u32,            // Bit depth
     pub sgnd: bool,           // Signedness
+    pub alpha: u16,           // Alpha channel info
     pub data: Vec<i32>,       // Pixel data
 }
 ```
@@ -78,6 +81,9 @@ pub struct CodingParameters {
     pub cblock_h_init: u32,
     pub prog_order: ProgOrder,
     pub num_layers: u32,
+    pub roi_compno: i32,        // ROI component index
+    pub roi_shift: i32,         // ROI shift value
+    pub use_jpwl: bool,         // Wireless extension support
     // ...
 }
 ```
@@ -131,6 +137,11 @@ Used with 5-3 DWT.
 
 #### Irreversible Color Transform (ICT)
 Used with 9-7 DWT. Similar to YCbCr conversion using standard coefficients.
+
+#### Custom MCT (Part 2 Extension)
+OpenJPEG supports custom decorrelation matrices via `opj_mct_encode_custom` and `opj_mct_decode_custom`.
+*   **Algorithm**: Matrix multiplication of component vector by a custom transformation matrix.
+*   **Requirements**: Reading/Writing `MCC` (Multiple Component Collection) and `MCO` (Multiple Component Output) markers if encoding, or applying them if decoding.
 
 ---
 
@@ -210,10 +221,38 @@ A packet header contains:
 *   `SIZ` (0xFF51): Image and tile size.
 *   `COD` (0xFF52): Coding style defaults.
 *   `QCD` (0xFF5C): Quantization default.
+*   **Advanced Markers**: `TLM` (Tile-part lengths), `PLT` (Packet length, tile-part), `PPM`/`PPT` (Packet headers).
 
 ---
 
-## 6. Implementation Roadmap
+## 6. Advanced Features (OpenJPEG Parity)
+
+### 6.1 Region of Interest (ROI)
+OpenJPEG implements the **Maxshift** method.
+*   **Encoding**: Coefficients belonging to the ROI are shifted up by `s` bits, where `s` is sufficient to ensure ROI coefficients are larger than any non-ROI coefficient.
+*   **Decoding**: Any coefficient magnitude $M \ge 2^s$ belongs to the ROI. The coefficient is shifted down by `s` bits.
+*   **Formula**: $s = \max(M_{non-ROI})$.
+
+### 6.2 JP2 Metadata Boxes
+To ensure full capability match, the codec must parse/write:
+*   **Palette (pclr)**: Maps single-channel values to multi-channel colors (LUT).
+*   **Component Mapping (cmap)**: Maps components to palette columns or direct channels.
+*   **Channel Definition (cdef)**: Defines which channel is Alpha, Red, Green, Blue, etc.
+
+### 6.3 Tile Parts
+A tile can be split into multiple **Tile Parts** (`SOT`...`SOD`...`SOT`...).
+*   **Implementation**: The decoder must accumulate packets from all tile-parts for a given tile index before decoding the tile.
+*   **Indexing**: `TLM` markers speed up seeking to specific tile-parts.
+
+### 6.4 Partial Decoding
+OpenJPEG supports decoding:
+*   **Reduced Resolution**: Discarding higher DWT levels (resolution reduction).
+*   **Area of Interest**: Decoding only code-blocks that intersect a requested window.
+*   **Layer Decoding**: Decoding only the first N quality layers.
+
+---
+
+## 7. Implementation Roadmap
 
 1.  **Foundation**:
     *   Implement `BitReader`/`BitWriter` (BIO).
@@ -221,7 +260,7 @@ A packet header contains:
     *   Define `Image` and `CodingParameters` structs.
 
 2.  **Codestream Parsing**:
-    *   Implement marker parsing (`SIZ`, `COD`, `QCD`).
+    *   Implement marker parsing (`SIZ`, `COD`, `QCD`, `TLM`, `PLT`).
     *   Implement `Tile` and `Component` setup logic.
 
 3.  **Tier 1 (Entropy)**:
@@ -231,8 +270,8 @@ A packet header contains:
 
 4.  **Math & Transform**:
     *   Implement `Dwt` (Forward/Inverse, 5-3/9-7).
-    *   Implement `Mct` (RCT/ICT).
-    *   Implement `Quantization`.
+    *   Implement `Mct` (RCT/ICT and Custom Matrix).
+    *   Implement `Quantization` and `ROI` scaling.
 
 5.  **Tier 2 (Packets)**:
     *   Implement `TagTree`.
@@ -242,13 +281,15 @@ A packet header contains:
 6.  **TCD Orchestration**:
     *   Connect T2 -> T1 -> DWT -> MCT for decoding.
     *   Connect MCT -> DWT -> T1 -> T2 for encoding.
+    *   Implement Partial Decoding logic (skipping resolutions/layers).
 
 7.  **JP2 File Format**:
     *   Wrap codestream in JP2 boxes (`ftyp`, `jp2h`, `jp2c`).
+    *   Implement `pclr`, `cmap`, `cdef` handling.
 
 ---
 
-## 7. Caveats & Pitfalls
+## 8. Caveats & Pitfalls
 
 1.  **Arithmetic Coder (MQC) Adaptation**:
     *   The probability estimation state machine is fragile. A single bit error desynchronizes the decoder. Ensure the `switch` behavior (LPS/MPS exchange) exactly matches the standard.
